@@ -33,6 +33,6 @@ class Event:
     hit_count_expected: int
 
     hits: List[Hit]
-
+    raw_bytes: bytes = b""
     # NEW: derived reconstruction products
     clusters: Tuple[HitCluster, ...] = ()

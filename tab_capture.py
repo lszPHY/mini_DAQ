@@ -117,6 +117,9 @@ class tab_capture(QtCore.QObject):
         self.lab_err_hit = QtWidgets.QLabel("0")
         self.lab_err_mtrl = QtWidgets.QLabel("0")
         self.lab_err_mhdr = QtWidgets.QLabel("0")
+        self.lab_valid = QtWidgets.QLabel("0")
+        self.lab_kept = QtWidgets.QLabel("0")
+        self.lab_pass = QtWidgets.QLabel("0.00%")
 
         row = 0
         dec.addWidget(QtWidgets.QLabel("Headers:"), row, 0)
@@ -133,6 +136,14 @@ class tab_capture(QtCore.QObject):
         row += 1
         dec.addWidget(QtWidgets.QLabel("Events buffered:"), row, 0)
         dec.addWidget(self.lab_evbuf, row, 1)
+        dec.addWidget(QtWidgets.QLabel("Valid events:"), row, 2)
+        dec.addWidget(self.lab_valid, row, 3)
+
+        row += 1
+        dec.addWidget(QtWidgets.QLabel("Kept events:"), row, 0)
+        dec.addWidget(self.lab_kept, row, 1)
+        dec.addWidget(QtWidgets.QLabel("Pass rate:"), row, 2)
+        dec.addWidget(self.lab_pass, row, 3)
 
         row += 1
         dec.addWidget(QtWidgets.QLabel("Err: event_id mismatch:"), row, 0)
@@ -152,16 +163,36 @@ class tab_capture(QtCore.QObject):
         if self.backend is None:
             return
 
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self.parent,
             "Select a saved .dat file to replay",
             os.getcwd(),
             "DAT files (*.dat);;All files (*.*)",
         )
-        if not path:
+        if not in_path:
+            return
+        
+        if in_path.lower().endswith(".dat"):
+            default_out = in_path[:-4] + "_filtered.dat"
+        else:
+            default_out = in_path + "_filtered.dat"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.parent,
+            "Save filtered replay output as",
+            default_out,
+            "DAT files (*.dat);;All files (*.*)",
+        )
+        if not out_path:
             return
 
-        self.backend.start_replay_dat(path, max_events_in_ram=256, max_mb=0)
+        self.backend.start_replay_dat(
+            dat_path=in_path,
+            out_filtered_path=out_path,
+            max_events_in_ram=256,
+            max_mb=0,
+        )
+
+        self.backend.start_replay_dat(dat_path=in_path,out_filtered_path=out_path ,max_events_in_ram=256, max_mb=0)
 
     # ------------------------------------------------------------------
     # settings
@@ -290,6 +321,9 @@ class tab_capture(QtCore.QObject):
         self.lab_trg.setText(str(int(snap.triggers)))
         self.lab_hit.setText(str(int(snap.hits_total)))
         self.lab_evbuf.setText(str(int(snap.events_buffered)))
+        self.lab_valid.setText(str(int(snap.valid_events)))
+        self.lab_kept.setText(str(int(snap.kept_events)))
+        self.lab_pass.setText(f"{100.0 * float(snap.pass_rate):.2f}%")
 
         self.lab_err_eid.setText(str(int(snap.err_event_id)))
         self.lab_err_hit.setText(str(int(snap.err_hit_count)))

@@ -130,6 +130,7 @@ class Backend(QtCore.QObject):
         Start capture + decode.
 
         DecodeThread is SINGLE and does NOT use geometry.
+                Added: DecodeThread uses the global chamber geometry and writes filtered events to .dat.
         """
         if self.is_running():
             self.stop_capture()
@@ -148,11 +149,19 @@ class Backend(QtCore.QObject):
 
         # event buffer for valid events
         self._event_buf = EventBuffer(max_events=max_events_in_ram)
+        
+        geo_for_decode = None
+        if self._geos:
+            geo_for_decode = next(iter(self._geos.values()))
 
         # decode thread (consumer)
         self._dec_thread = DecodeThread(
             analysis_q=self._analysis_q,
             event_buffer=self._event_buf,
+            #added geo
+            geo=geo_for_decode,
+            dat_out_path=out_path,
+
             max_tdcs=40,
             adc_bins=256,
             tdc_bins=4096,
@@ -270,11 +279,12 @@ class Backend(QtCore.QObject):
         if emit_signal:
             self.event_changed.emit(None)
     
-    def start_replay_dat(self, dat_path: str, max_events_in_ram: int = 256, max_mb: int = 0, realtime: bool = False):
+    def start_replay_dat(self, dat_path: str, out_filtered_path: Optional[str]=None, max_events_in_ram: int = 256, max_mb: int = 0, realtime: bool = False):
         """
         Offline replay: read a saved .dat file and feed DecodeThread,
         so GUI plots update using the EXISTING pyqtgraph logic.
         """
+        self._current_out_path= str(out_filtered_path) if out_filtered_path else None
         if self.is_running():
             self.stop_capture()
 
@@ -290,11 +300,15 @@ class Backend(QtCore.QObject):
 
         # event buffer for valid events
         self._event_buf = EventBuffer(max_events=max_events_in_ram)
-
+        geo_for_decode=None
+        if self._geos:
+            geo_for_decode=next(iter(self._geos.values()))
         # decode thread (consumer)
         self._dec_thread = DecodeThread(
             analysis_q=self._analysis_q,
             event_buffer=self._event_buf,
+            dat_out_path= out_filtered_path,
+            geo=geo_for_decode,
             max_tdcs=40,
             adc_bins=256,
             tdc_bins=4096,

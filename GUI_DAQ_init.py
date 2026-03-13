@@ -56,6 +56,7 @@ class StartQT5(QtWidgets.QMainWindow):
         self.backend = Backend()
 
         # Your backend API: register geometries for GUI usage (DecodeThread does NOT use them)
+        #used IN GUI
         if hasattr(self.backend, "set_geometries_from_list"):
             self.backend.set_geometries_from_list(self.geos)
         elif hasattr(self.backend, "set_geometries"):
@@ -93,16 +94,32 @@ class StartQT5(QtWidgets.QMainWindow):
             pass
 
     def _replay_dat_dialog(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select a saved .dat file to replay",
             os.getcwd(),
             "DAT files (*.dat);;All files (*.*)",
         )
-        if not path:
+        if not in_path:
             return
+        
+
+        if in_path.lower().endswith(".dat"):
+            default_out = in_path[:-4] + "_filtered.dat"
+        else:
+            default_out = in_path + "_filtered.dat"
+
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save filtered replay output as",
+            default_out,
+            "DAT files (*.dat);;All files (*.*)",
+        )
+        if not out_path:
+            return
+
         # max_mb=0 means no limit; realtime=False means fastest possible replay
-        self.backend.start_replay_dat(path, max_events_in_ram=256, max_mb=0, realtime=False)
+        self.backend.start_replay_dat(dat_path= in_path,out_filtered_path= out_path, max_events_in_ram=256, max_mb=0, realtime=False)
 
 
 # =============================================================================

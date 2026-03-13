@@ -15,7 +15,7 @@ class CaptureThread(QtCore.QThread):
     """
     CaptureThread responsibilities:
       1) Capture raw packets from NIC
-      2) Write ALL raw bytes to .dat file (ground truth)
+      2) Write ALL raw bytes to .dat file (ground truth) Deleted, do not write
       3) Push immutable bytes into analysis queue (non-blocking)
 
     This thread does:
@@ -49,7 +49,7 @@ class CaptureThread(QtCore.QThread):
 
         self._stop = False
         self._cap: Optional[PCapSessionHandlerPy] = None
-        self._fh = None
+        
 
     # ------------------------------------------------------------------
 
@@ -83,17 +83,6 @@ class CaptureThread(QtCore.QThread):
             )
             return
 
-        # ---------- open output file ----------
-        try:
-            self._open_output()
-        except Exception as e:
-            self.message.emit(f"[ERROR] Failed to open output file: {repr(e)}\n")
-            try:
-                self._cap.close()
-            except Exception:
-                pass
-            return
-
         last_stat_emit = time.time()
 
         # ---------- main capture loop ----------
@@ -105,19 +94,10 @@ class CaptureThread(QtCore.QThread):
                 break
 
             if data.packetBuffer:
-                # 1) WRITE RAW BYTES TO DISK (always)
-                try:
-                    self._fh.write(data.packetBuffer)
-                except Exception as e:
-                    self.message.emit(f"[ERROR] Write failed: {repr(e)}\n")
-                    break
-
-                # 2) PUSH IMMUTABLE COPY TO ANALYSIS (non-blocking)
                 try:
                     self.analysis_q.put_nowait(bytes(data.packetBuffer))
                 except queue.Full:
-                    # Analysis is slower than capture ? drop decode data only
-                    # Disk data is still intact
+                    # Analysis is slower than capture; drop decode data only.
                     pass
 
             # ---------- emit stats periodically ----------
@@ -127,19 +107,11 @@ class CaptureThread(QtCore.QThread):
                     self._cap.totalPackets,
                     self._cap.data.lostPackets,
                     self._cap.totalBufferedBytes,
-                    os.path.basename(self.out_path),
+                    os.path.basename(self.out_path) if self.out_path else "",
                 )
                 last_stat_emit = now
 
         # ---------- cleanup ----------
-        try:
-            if self._fh:
-                self._fh.flush()
-                self._fh.close()
-        except Exception:
-            pass
-        self._fh = None
-
         try:
             if self._cap:
                 self._cap.close()
