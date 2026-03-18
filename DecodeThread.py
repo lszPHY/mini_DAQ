@@ -147,6 +147,7 @@ class DecodeThread(QtCore.QThread):
         #counting numbers
         self._evt_valid_total = 0
         self._evt_kept_total = 0
+        self._stream_buf = bytearray()
 
     def stop(self):
         self._stop = True
@@ -359,13 +360,21 @@ class DecodeThread(QtCore.QThread):
                     continue
 
                 # ? NO GEO HERE
+                print("chunk_len =", len(chunk), "remainder =", len(chunk) % 5)
                 #edited geo
                 WORD_SIZE = 5
-                n = len(chunk) // WORD_SIZE
+                #n = len(chunk) // WORD_SIZE
+                self._stream_buf.extend(chunk)
+                n = len(self._stream_buf)//WORD_SIZE
+                if n ==0:
+                    self._emit_1hz_if_needed()
+                    continue
                 #added
                 for i in range(n):
-                    word5 = chunk[i * WORD_SIZE:(i + 1) * WORD_SIZE]
-                    s = decode_word5(word5, geo=self.geo)   
+                    word5 = bytes(self._stream_buf[i * WORD_SIZE:(i + 1) * WORD_SIZE])
+                    s = decode_word5(word5, geo=self.geo)
+                    #word5 = chunk[i * WORD_SIZE:(i + 1) * WORD_SIZE]
+                    #s = decode_word5(word5, geo=self.geo)   
                     st = s.type
 
                     if st == SignalType.EVENT_HEADER and s.header is not None: #header
@@ -420,6 +429,9 @@ class DecodeThread(QtCore.QThread):
                         if 0 <= t < self.max_tdcs:
                             self._derr[t] += 1
                         continue
+                consumed=n*WORD_SIZE
+                if consumed >0:
+                    self._stream_buf=self._stream_buf[consumed:]
 
                 self._emit_1hz_if_needed()
         finally:
