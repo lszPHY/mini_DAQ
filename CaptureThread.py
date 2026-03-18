@@ -49,6 +49,7 @@ class CaptureThread(QtCore.QThread):
 
         self._stop = False
         self._cap: Optional[PCapSessionHandlerPy] = None
+        self._fh = None #test raw data
         
 
     # ------------------------------------------------------------------
@@ -84,6 +85,17 @@ class CaptureThread(QtCore.QThread):
             return
 
         last_stat_emit = time.time()
+        # ---------- open output file ----------#tested raw data
+        try:
+            self._open_output()
+        except Exception as e:
+            self.message.emit(f"[ERROR] Failed to open output file: {repr(e)}\n")
+            try:
+                self._cap.close()
+            except Exception:
+                pass
+            self._cap = None
+            return
 
         # ---------- main capture loop ----------
         while not self._stop:
@@ -94,6 +106,13 @@ class CaptureThread(QtCore.QThread):
                 break
 
             if data.packetBuffer:
+                try:
+                    self._fh.write(data.packetBuffer)
+                    self._total_captured_bytes += len(data.packetBuffer)
+                except Exception as e:
+                    self.message.emit(f"[ERROR] Write failed: {repr(e)}\n")
+                    break
+                ### raw data write above
                 try:
                     self.analysis_q.put_nowait(bytes(data.packetBuffer))
                 except queue.Full:
@@ -112,6 +131,14 @@ class CaptureThread(QtCore.QThread):
                 last_stat_emit = now
 
         # ---------- cleanup ----------
+        try:
+            if self._fh:
+                self._fh.flush()
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+        ### test above
         try:
             if self._cap:
                 self._cap.close()

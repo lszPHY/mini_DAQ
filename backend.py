@@ -136,6 +136,14 @@ class Backend(QtCore.QObject):
             self.stop_capture()
 
         self._current_out_path = str(out_path)
+        base, ext = os.path.splitext(out_path)
+        if not ext:
+            ext = ".dat"
+
+        raw_path = base + "_raw" + ext
+        filtered_path = base + "_filtered" + ext
+
+        self._current_out_path = str(filtered_path)
 
         # clear analysis queue (drop old bytes)
         try:
@@ -160,7 +168,7 @@ class Backend(QtCore.QObject):
             event_buffer=self._event_buf,
             #added geo
             geo=geo_for_decode,
-            dat_out_path=out_path,
+            dat_out_path=filtered_path,
 
             max_tdcs=40,
             adc_bins=256,
@@ -173,7 +181,7 @@ class Backend(QtCore.QObject):
         self._cap_thread = CaptureThread(
             dev=dev,
             bpf=bpf,
-            out_path=out_path,
+            out_path=raw_path,
             analysis_q=self._analysis_q,
         )
         self._cap_thread.message.connect(self.message)
