@@ -50,6 +50,7 @@ class CaptureThread(QtCore.QThread):
         self._stop = False
         self._cap: Optional[PCapSessionHandlerPy] = None
         self._fh = None #test raw data
+        self._total_captured_bytes=0
         
 
     # ------------------------------------------------------------------
