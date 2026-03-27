@@ -5,6 +5,10 @@ import time
 import queue
 from dataclasses import dataclass
 from typing import List, Optional
+#used in tigger time determination
+import os 
+import csv
+from bisect import bisect_left
 
 import numpy as np
 from PyQt5 import QtCore
@@ -149,6 +153,18 @@ class DecodeThread(QtCore.QThread):
         self._evt_kept_total = 0
         self._stream_buf = bytearray()
 
+        # trigger study
+        self._word_index = 0
+        self._cur_header_word_index = None
+        self._all_triggers = []   # list of dict: word_index, raw40, time_ns
+        self._all_events_for_trigger_study = []  # list of dict: event_id, header_word_index, hit_times_ns
+        self._trigger_study_csv_written= False
+
+        # trigger timestamp settings
+        self._trigger_time_lsb_ns = 0.78125
+        self._trigger_time_mask = 0x1FFFF   # low 17 bits
+        self._trigger_time_period_ns = (self._trigger_time_mask + 1) * self._trigger_time_lsb_ns
+
     def stop(self):
         self._stop = True
 
@@ -158,6 +174,7 @@ class DecodeThread(QtCore.QThread):
         self._cur_rd_bank_sel = 0
         self._cur_hits = []
         self._cur_hit_count = 0
+        self._cur_header_word_index=None
         self._cur_raw = bytearray()
 
     def _finalize_event(self, trailer_event_id20: int, trigger_count: int, hit_expected: int):
@@ -199,6 +216,24 @@ class DecodeThread(QtCore.QThread):
         self._cur_hits = []
         raw_bytes=bytes(self._cur_raw)
 
+        hit_times_ns = [float(h.ledge) * self._trigger_time_lsb_ns for h in hits]
+        self._all_events_for_trigger_study.append(
+            {
+                "event_id": self._cur_event_id20,
+                "header_word_index": self._cur_header_word_index,
+                "hit_times_ns": hit_times_ns,
+            }
+        )
+        if len(self._all_events_for_trigger_study) == 500000: # trigger study can be deleted
+            self._write_trigger_study_csv()
+        if len(self._all_events_for_trigger_study) % 1000 == 0:
+            print(
+                "EVENT APPEND, id(self) =",
+                id(self),
+                "n_events =",
+                len(self._all_events_for_trigger_study),
+            )
+
         ev = Event(
             event_id20=self._cur_event_id20,
             rd_bank_sel=self._cur_rd_bank_sel,
@@ -214,12 +249,12 @@ class DecodeThread(QtCore.QThread):
         if keep:
             self._evt_kept_total += 1
             if self._fh is not None:
-                print(
+                """ print(
                     "KEEP",
                     "eid=", self._cur_event_id20,
                     "hits=", len(hits),
                     "raw_len=", len(raw_bytes),
-                )
+                ) """
                 self._fh.write(raw_bytes)
         self._reset_event()
     #determine if there are different clusters
@@ -345,9 +380,107 @@ class DecodeThread(QtCore.QThread):
                 return False
         
         return True
+    
+
+    def _wrap_delta_ns(self, delta_ns: float) -> float:
+        period = self._trigger_time_period_ns
+        return ((delta_ns + period / 2.0) % period) - period / 2.0
+
+    def _find_trigger_candidates(self, header_word_index: int):
+        trigger_word_indices = [t["word_index"] for t in self._all_triggers]
+        pos = bisect_left(trigger_word_indices, header_word_index)
+
+        candidates = []
+        if pos - 2 >= 0:
+            candidates.append((-2, self._all_triggers[pos - 2]))
+        if pos - 1 >= 0:
+            candidates.append((-1, self._all_triggers[pos - 1]))
+        if pos < len(self._all_triggers):
+            candidates.append((+1, self._all_triggers[pos]))
+        if pos + 1 < len(self._all_triggers):
+            candidates.append((+2, self._all_triggers[pos + 1]))
+        return candidates
+
+    def _write_trigger_study_csv(self):
+        print("WRITE CSV CALLED，idself=",id(self))
+        print("dat_out_path =", self.dat_out_path)
+        print("n_triggers =", len(self._all_triggers))
+        print("n_events =", len(self._all_events_for_trigger_study))
+        if self._trigger_study_csv_written:
+            return
+        self._trigger_study_csv_written = True
+        
+        if not self._all_events_for_trigger_study or not self._all_triggers:
+            return
+
+        if self.dat_out_path:
+            base, ext = os.path.splitext(self.dat_out_path)
+            csv_path = base + "_trigger_study.csv"
+        else:
+            csv_path = os.path.join(os.getcwd(), "trigger_study.csv")
+        
+        print("csv_path =", csv_path)
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "event_id",
+                    "header_word_index",
+                    "candidate_offset",
+                    "trigger_word_index",
+                    "trigger_raw40_hex",
+                    "trigger_time_ns",
+                    "hit_index",
+                    "hit_time_ns",
+                    "delta_ns_wrapped",
+                    "event_min_hit_time_ns",
+                    "event_min_hit_delta_ns_wrapped",
+                ]
+            )
+
+            for ev in self._all_events_for_trigger_study:
+                header_word_index = ev["header_word_index"]
+                if header_word_index is None:
+                    continue
+
+                hit_times_ns = ev["hit_times_ns"]
+                if not hit_times_ns:
+                    continue
+
+                candidates = self._find_trigger_candidates(header_word_index)
+                if not candidates:
+                    continue
+
+                event_min_hit_time_ns = min(hit_times_ns)
+
+                for offset, trig in candidates:
+                    trig_time_ns = trig["time_ns"]
+                    trig_raw40_hex = hex(trig["raw40"])
+                    event_min_hit_delta = self._wrap_delta_ns(event_min_hit_time_ns - trig_time_ns)
+
+                    for hit_idx, hit_time_ns in enumerate(hit_times_ns):
+                        delta_ns = self._wrap_delta_ns(hit_time_ns - trig_time_ns)
+                        writer.writerow(
+                            [
+                                ev["event_id"],
+                                header_word_index,
+                                offset,
+                                trig["word_index"],
+                                trig_raw40_hex,
+                                trig_time_ns,
+                                hit_idx,
+                                hit_time_ns,
+                                delta_ns,
+                                event_min_hit_time_ns,
+                                event_min_hit_delta,
+                            ]
+                        )
+
 
     
     def run(self):
+        print("DECODE RUN START, id(self) =", id(self), "dat_out_path =", self.dat_out_path)
         if self.dat_out_path:
             self._fh= open(self.dat_out_path, "wb")
         
@@ -360,7 +493,7 @@ class DecodeThread(QtCore.QThread):
                     continue
 
                 # ? NO GEO HERE
-                print("chunk_len =", len(chunk), "remainder =", len(chunk) % 5)
+                """ print("chunk_len =", len(chunk), "remainder =", len(chunk) % 5) """
                 #edited geo
                 WORD_SIZE = 5
                 #n = len(chunk) // WORD_SIZE
@@ -376,6 +509,7 @@ class DecodeThread(QtCore.QThread):
                     #word5 = chunk[i * WORD_SIZE:(i + 1) * WORD_SIZE]
                     #s = decode_word5(word5, geo=self.geo)   
                     st = s.type
+                    self._word_index+=1
 
                     if st == SignalType.EVENT_HEADER and s.header is not None: #header
                         self._hdr += 1
@@ -386,6 +520,7 @@ class DecodeThread(QtCore.QThread):
                         self._cur_open = True
                         self._cur_event_id20 = int(s.header.event_id20)
                         self._cur_rd_bank_sel = int(s.header.rd_bank_sel)
+                        self._cur_header_word_index=self._word_index
                         self._cur_hits = []
                         self._cur_hit_count = 0
                         self._cur_raw = bytearray()
@@ -416,6 +551,18 @@ class DecodeThread(QtCore.QThread):
 
                     if st == SignalType.TRIGGER:
                         self._trg += 1
+                        trigger_raw40 = s.raw40
+                        trigger_time_ns = float(trigger_raw40 & self._trigger_time_mask) * self._trigger_time_lsb_ns
+
+                        self._all_triggers.append(
+                            {
+                                "word_index": self._word_index,
+                                "raw40": trigger_raw40,
+                                "time_ns": trigger_time_ns,
+                            }
+                        )
+                        if self._trg % 1000 == 0:
+                            print("TRIGGER APPEND, id(self) =", id(self), "n_triggers =", len(self._all_triggers))
                         continue
 
                     if st == SignalType.OVERFLOW and s.overflow is not None:
@@ -439,6 +586,8 @@ class DecodeThread(QtCore.QThread):
                 self._fh.flush()
                 self._fh.close()
                 self._fh = None
+        
+            self._write_trigger_study_csv()
 
     def _emit_1hz_if_needed(self):
         now = time.time()
