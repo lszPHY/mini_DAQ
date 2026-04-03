@@ -13,7 +13,7 @@ from bisect import bisect_left
 import numpy as np
 from PyQt5 import QtCore
 
-from Signal import SignalType, Hit, decode_stream, decode_word5
+from Signal import SignalType, Hit, decode_word5
 from Event import Event
 from geometry import Geometry
 
@@ -158,12 +158,68 @@ class DecodeThread(QtCore.QThread):
         self._cur_header_word_index = None
         self._all_triggers = []   # list of dict: word_index, raw40, time_ns
         self._all_events_for_trigger_study = []  # list of dict: event_id, header_word_index, hit_times_ns
-        self._trigger_study_csv_written= False
+        self._trigger_study_csv_written = False
+        self._midrun_csv_written = False
 
         # trigger timestamp settings
         self._trigger_time_lsb_ns = 0.78125
         self._trigger_time_mask = 0x1FFFF   # low 17 bits
         self._trigger_time_period_ns = (self._trigger_time_mask + 1) * self._trigger_time_lsb_ns
+
+        self._store_trigger_dt_min_ns = 196
+        self._store_trigger_dt_max_ns = 596
+        self._cur_first_trigger_after_header = None
+        self._pending_events_for_store = []
+        self._dt_debug_print_count = 0
+        self._kept_match_rows = []
+
+    def _maybe_write_midrun_csv(self):
+        if self._midrun_csv_written:
+            return
+        if self._evt_valid_total < 100000:
+            return
+
+        # self._write_kept_match_csv()
+        # self._write_trigger_study_csv()
+        self._midrun_csv_written = True
+    def _write_kept_match_csv(self):
+        if not self._kept_match_rows:
+            return
+
+        if self.dat_out_path:
+            base, ext = os.path.splitext(self.dat_out_path)
+            csv_path = base + "_kept_matches.csv"
+        else:
+            csv_path = os.path.join(os.getcwd(), "kept_matches.csv")
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "source",
+                    "event_id20",
+                    "header_word_index",
+                    "trigger_word_index",
+                    "trigger_time_ns",
+                    "event_min_hit_time_ns",
+                    "dt_ns_wrapped",
+                    "n_hits",
+                ]
+            )
+            for row in self._kept_match_rows:
+                writer.writerow(
+                    [
+                        row["source"],
+                        row["event_id20"],
+                        row["header_word_index"],
+                        row["trigger_word_index"],
+                        row["trigger_time_ns"],
+                        row["event_min_hit_time_ns"],
+                        row["dt_ns_wrapped"],
+                        row["n_hits"],
+                    ]
+                )
+
 
     def stop(self):
         self._stop = True
@@ -174,7 +230,8 @@ class DecodeThread(QtCore.QThread):
         self._cur_rd_bank_sel = 0
         self._cur_hits = []
         self._cur_hit_count = 0
-        self._cur_header_word_index=None
+        self._cur_header_word_index = None
+        self._cur_first_trigger_after_header = None
         self._cur_raw = bytearray()
 
     def _finalize_event(self, trailer_event_id20: int, trigger_count: int, hit_expected: int):
@@ -214,7 +271,7 @@ class DecodeThread(QtCore.QThread):
 
         hits = self._cur_hits
         self._cur_hits = []
-        raw_bytes=bytes(self._cur_raw)
+        raw_bytes = bytes(self._cur_raw)
 
         hit_times_ns = [float(h.ledge) * self._trigger_time_lsb_ns for h in hits]
         self._all_events_for_trigger_study.append(
@@ -224,38 +281,68 @@ class DecodeThread(QtCore.QThread):
                 "hit_times_ns": hit_times_ns,
             }
         )
-        if len(self._all_events_for_trigger_study) == 500000: # trigger study can be deleted
-            self._write_trigger_study_csv()
-        if len(self._all_events_for_trigger_study) % 1000 == 0:
-            print(
-                "EVENT APPEND, id(self) =",
-                id(self),
-                "n_events =",
-                len(self._all_events_for_trigger_study),
-            )
-
-        ev = Event(
-            event_id20=self._cur_event_id20,
-            rd_bank_sel=self._cur_rd_bank_sel,
-            trigger_count=trigger_count,
-            hit_count_expected=hit_expected,
-            hits=hits,
-            raw_bytes=raw_bytes,
-        )
-        self.buf.push(ev)
 
         self._evt_valid_total += 1
-        keep = self._should_store_event(hits)
-        if keep:
-            self._evt_kept_total += 1
-            if self._fh is not None:
-                """ print(
-                    "KEEP",
-                    "eid=", self._cur_event_id20,
-                    "hits=", len(hits),
-                    "raw_len=", len(raw_bytes),
-                ) """
-                self._fh.write(raw_bytes)
+        self._maybe_write_midrun_csv()
+        event_min_hit_time_ns = min(hit_times_ns) if hit_times_ns else None
+
+        # Case 1: the FIRST trigger after the header already appeared before trailer.
+        if self._cur_first_trigger_after_header is not None:
+            trigger_raw40 = int(self._cur_first_trigger_after_header)
+            trigger_time_ns = float(trigger_raw40 & self._trigger_time_mask) * self._trigger_time_lsb_ns
+            
+            dt_ns = self._wrap_delta_ns(event_min_hit_time_ns - trigger_time_ns)
+
+            keep = self._should_store_event(
+                hits,
+                event_min_hit_time_ns=event_min_hit_time_ns,
+                trigger_time_ns=trigger_time_ns,
+            )
+            if keep:
+                self._kept_match_rows.append(
+                    {
+                        "source": "open",
+                        "event_id20": self._cur_event_id20,
+                        "header_word_index": self._cur_header_word_index,
+                        "trigger_word_index": self._word_index,
+                        "trigger_time_ns": trigger_time_ns,
+                        "event_min_hit_time_ns": event_min_hit_time_ns,
+                        "dt_ns_wrapped": dt_ns,
+                        "n_hits": len(hits),
+                    }
+                )
+                trigger_raw_bytes = trigger_raw40.to_bytes(5, byteorder="big")
+                raw_bytes_to_store = raw_bytes+ trigger_raw_bytes 
+
+                ev = Event(
+                    event_id20=self._cur_event_id20,
+                    rd_bank_sel=self._cur_rd_bank_sel,
+                    trigger_count=trigger_count,
+                    hit_count_expected=hit_expected,
+                    hits=hits,
+                    raw_bytes=raw_bytes_to_store,
+                )
+                self.buf.push(ev)
+                self._evt_kept_total += 1
+                if self._fh is not None:
+                    self._fh.write(raw_bytes_to_store)
+
+            self._reset_event()
+            return
+
+        # Case 2: no trigger yet; defer until the FIRST later trigger arrives.
+        self._pending_events_for_store.append(
+            {
+                "event_id20": self._cur_event_id20,
+                "rd_bank_sel": self._cur_rd_bank_sel,
+                "trigger_count": trigger_count,
+                "hit_count_expected": hit_expected,
+                "hits": hits,
+                "raw_bytes": raw_bytes,
+                "header_word_index": self._cur_header_word_index,
+                "event_min_hit_time_ns": event_min_hit_time_ns,
+            }
+        )
         self._reset_event()
     #determine if there are different clusters
     def _largest_cluster_size(self, fired_tubes, max_dlayer=1, max_dcol=2):
@@ -297,23 +384,43 @@ class DecodeThread(QtCore.QThread):
 
         return largest
     #filter
-    def _should_store_event(self, hits: List[Hit]) -> bool:
+    def _should_store_event(
+        self,
+        hits: List[Hit],
+        event_min_hit_time_ns: Optional[float] = None,
+        trigger_time_ns: Optional[float] = None,
+    ) -> bool:
+        # Timing cut: keep only if the matched trigger exists and
+        # trigger_time - earliest_hit_time is within the configured window.
+        if event_min_hit_time_ns is None or trigger_time_ns is None:
+            return False
+
+        dt_ns = self._wrap_delta_ns( event_min_hit_time_ns-trigger_time_ns)
+        if self._dt_debug_print_count < 200:
+            print(
+                "dt_ns=", dt_ns,
+                "event_min_hit_time_ns=", event_min_hit_time_ns,
+                "trigger_time_ns=", trigger_time_ns,
+            )
+            self._dt_debug_print_count += 1
+        #if not (self._store_trigger_dt_min_ns <= dt_ns <= self._store_trigger_dt_max_ns):
+            #return False
+
         fired_layers = set()
         layer_to_cols = {}
-        fired_tubes = set()
         layer_to_xs = {}
-        X_GAP_THRESHOLD=2*15
-        X_NEIBGHOR_THRESHOLD=45
+        X_GAP_THRESHOLD = 30.0
+        X_NEIGHBOR_THRESHOLD = 45.0
         for h in hits:
             layer = int(h.layer)
             col = int(h.col)
-            x=float(h.x)
+            x = float(h.x)
             # 没有正确几何映射，直接不存，避免误判
             if layer < 0 or col < 0:
                 return False
 
             fired_layers.add(layer)
-            
+
             if layer not in layer_to_cols:
                 layer_to_cols[layer] = set()
             layer_to_cols[layer].add(col)
@@ -322,18 +429,15 @@ class DecodeThread(QtCore.QThread):
                 layer_to_xs[layer] = []
             layer_to_xs[layer].append(x)
 
-
-
         # 至少经过 6 个全局 layer（0~7）
         if len(fired_layers) < 6:
             return False
-        
+
         # 每层最多 2 根 tube
         for cols in layer_to_cols.values():
             if len(cols) > 2:
                 return False
-                # 新增过滤条件：相邻两层之间，必须至少存在一对 hit，
-        
+        # 新增过滤条件：相邻两层之间，必须至少存在一对 hit，
         # 其横向间距 <= 2 个 tube；否则认为轨迹在相邻层之间跳得太远，不保留。
         sorted_layers = sorted(layer_to_xs.keys())
         for i in range(len(sorted_layers) - 1):
@@ -344,8 +448,6 @@ class DecodeThread(QtCore.QThread):
             if l1 != l0 + 1:
                 continue
 
-            #cols0 = layer_to_cols[l0]
-            #cols1 = layer_to_cols[l1]
             xs0 = layer_to_xs.get(l0, [])
             xs1 = layer_to_xs.get(l1, [])
             if not xs0 or not xs1:
@@ -354,7 +456,7 @@ class DecodeThread(QtCore.QThread):
             close_enough = False
             for x0 in xs0:
                 for x1 in xs1:
-                    if abs(x0 - x1) <= X_NEIBGHOR_THRESHOLD:
+                    if abs(x0 - x1) <= X_NEIGHBOR_THRESHOLD:
                         close_enough = True
                         break
                 if close_enough:
@@ -362,23 +464,15 @@ class DecodeThread(QtCore.QThread):
 
             if not close_enough:
                 return False
-        #largest_cluster = self._largest_cluster_size(fired_tubes, max_dlayer=1, max_dcol=2)
-        #total_tubes = len(fired_tubes)
-        #if largest_cluster / total_tubes < 0.8:
-            #return False
-        
-        # 尝试：每个 multilayer 内的横向展开不能太宽
-        # 尝试：同一层内，所有有效 tube 的相邻列间距不得超过 2。
-       
-                # 同一层内，最左和最右的横向跨度不能太大
+
         for xs in layer_to_xs.values():
             xs = sorted(set(xs))
             if len(xs) <= 1:
                 continue
 
-            if max(xs)-min(xs)>=X_GAP_THRESHOLD:
+            if max(xs) - min(xs) >= X_GAP_THRESHOLD:
                 return False
-        
+
         return True
     
 
@@ -520,7 +614,8 @@ class DecodeThread(QtCore.QThread):
                         self._cur_open = True
                         self._cur_event_id20 = int(s.header.event_id20)
                         self._cur_rd_bank_sel = int(s.header.rd_bank_sel)
-                        self._cur_header_word_index=self._word_index
+                        self._cur_header_word_index = self._word_index
+                        self._cur_first_trigger_after_header = None
                         self._cur_hits = []
                         self._cur_hit_count = 0
                         self._cur_raw = bytearray()
@@ -561,8 +656,67 @@ class DecodeThread(QtCore.QThread):
                                 "time_ns": trigger_time_ns,
                             }
                         )
-                        if self._trg % 1000 == 0:
-                            print("TRIGGER APPEND, id(self) =", id(self), "n_triggers =", len(self._all_triggers))
+
+                        # Prefer the currently open event: if a trigger arrives while an event is open,
+                        # treat it as the first trigger for that current event only.
+                        if self._cur_open:
+                            if self._cur_first_trigger_after_header is None:
+                                self._cur_first_trigger_after_header = trigger_raw40
+                            continue
+
+                        # Otherwise, use this trigger for the MOST RECENT finalized event that is still
+                        # waiting for its first later trigger.
+                        if self._pending_events_for_store:
+                            pending = self._pending_events_for_store.pop()
+                            event_min_hit_time_ns = pending.get("event_min_hit_time_ns")
+
+                            if event_min_hit_time_ns is not None:
+                                hits = pending["hits"]
+                                if self._dt_debug_print_count < 260:
+                                    print(
+                                        "PENDING MATCH:",
+                                        "header_word_index=", pending.get("header_word_index"),
+                                        "trigger_word_index=", self._word_index,
+                                        "word_gap=", self._word_index - pending.get("header_word_index", self._word_index),
+                                        "event_min_hit_time_ns=", event_min_hit_time_ns,
+                                        "trigger_time_ns=", trigger_time_ns,
+                                    )
+
+                                keep = self._should_store_event(
+                                    hits,
+                                    event_min_hit_time_ns=event_min_hit_time_ns,
+                                    trigger_time_ns=trigger_time_ns,
+                                )
+
+                                if keep:
+                                    dt_ns = self._wrap_delta_ns(event_min_hit_time_ns - trigger_time_ns)
+                                    self._kept_match_rows.append(
+                                        {
+                                            "source": "pending",
+                                            "event_id20": pending["event_id20"],
+                                            "header_word_index": pending.get("header_word_index"),
+                                            "trigger_word_index": self._word_index,
+                                            "trigger_time_ns": trigger_time_ns,
+                                            "event_min_hit_time_ns": event_min_hit_time_ns,
+                                            "dt_ns_wrapped": dt_ns,
+                                            "n_hits": len(hits),
+                                        }
+                                    )
+                                    trigger_raw_bytes = int(trigger_raw40).to_bytes(5, byteorder="big")
+                                    raw_bytes_to_store = pending["raw_bytes"] + trigger_raw_bytes
+
+                                    ev = Event(
+                                        event_id20=pending["event_id20"],
+                                        rd_bank_sel=pending["rd_bank_sel"],
+                                        trigger_count=pending["trigger_count"],
+                                        hit_count_expected=pending["hit_count_expected"],
+                                        hits=hits,
+                                        raw_bytes=raw_bytes_to_store,
+                                    )
+                                    self.buf.push(ev)
+                                    self._evt_kept_total += 1
+                                    if self._fh is not None:
+                                        self._fh.write(raw_bytes_to_store)
                         continue
 
                     if st == SignalType.OVERFLOW and s.overflow is not None:
@@ -587,7 +741,9 @@ class DecodeThread(QtCore.QThread):
                 self._fh.close()
                 self._fh = None
         
-            self._write_trigger_study_csv()
+            # self._pending_events_for_store.clear()
+            # self._write_kept_match_csv()
+            # self._write_trigger_study_csv()
 
     def _emit_1hz_if_needed(self):
         now = time.time()
