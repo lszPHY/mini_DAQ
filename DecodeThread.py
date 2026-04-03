@@ -285,17 +285,18 @@ class DecodeThread(QtCore.QThread):
         self._evt_valid_total += 1
         self._maybe_write_midrun_csv()
         event_min_hit_time_ns = min(hit_times_ns) if hit_times_ns else None
-
+        event_median_hit_time_ns = float(np.median(hit_times_ns)) if hit_times_ns else None
+        event_ref_hit_time_ns = event_median_hit_time_ns
         # Case 1: the FIRST trigger after the header already appeared before trailer.
         if self._cur_first_trigger_after_header is not None:
             trigger_raw40 = int(self._cur_first_trigger_after_header)
             trigger_time_ns = float(trigger_raw40 & self._trigger_time_mask) * self._trigger_time_lsb_ns
-            
-            dt_ns = self._wrap_delta_ns(event_min_hit_time_ns - trigger_time_ns)
+
+            dt_ns = self._wrap_delta_ns(event_ref_hit_time_ns - trigger_time_ns)
 
             keep = self._should_store_event(
                 hits,
-                event_min_hit_time_ns=event_min_hit_time_ns,
+                event_ref_hit_time_ns=event_ref_hit_time_ns,
                 trigger_time_ns=trigger_time_ns,
             )
             if keep:
@@ -306,13 +307,13 @@ class DecodeThread(QtCore.QThread):
                         "header_word_index": self._cur_header_word_index,
                         "trigger_word_index": self._word_index,
                         "trigger_time_ns": trigger_time_ns,
-                        "event_min_hit_time_ns": event_min_hit_time_ns,
+                        "event_min_hit_time_ns": event_ref_hit_time_ns,
                         "dt_ns_wrapped": dt_ns,
                         "n_hits": len(hits),
                     }
                 )
                 trigger_raw_bytes = trigger_raw40.to_bytes(5, byteorder="big")
-                raw_bytes_to_store = raw_bytes+ trigger_raw_bytes 
+                raw_bytes_to_store = raw_bytes + trigger_raw_bytes
 
                 ev = Event(
                     event_id20=self._cur_event_id20,
@@ -341,6 +342,7 @@ class DecodeThread(QtCore.QThread):
                 "raw_bytes": raw_bytes,
                 "header_word_index": self._cur_header_word_index,
                 "event_min_hit_time_ns": event_min_hit_time_ns,
+                "event_median_hit_time_ns": event_median_hit_time_ns,
             }
         )
         self._reset_event()
@@ -387,24 +389,24 @@ class DecodeThread(QtCore.QThread):
     def _should_store_event(
         self,
         hits: List[Hit],
-        event_min_hit_time_ns: Optional[float] = None,
+        event_ref_hit_time_ns: Optional[float] = None,
         trigger_time_ns: Optional[float] = None,
     ) -> bool:
         # Timing cut: keep only if the matched trigger exists and
         # trigger_time - earliest_hit_time is within the configured window.
-        if event_min_hit_time_ns is None or trigger_time_ns is None:
+        if event_ref_hit_time_ns is None or trigger_time_ns is None:
             return False
 
-        dt_ns = self._wrap_delta_ns( event_min_hit_time_ns-trigger_time_ns)
+        dt_ns = self._wrap_delta_ns(event_ref_hit_time_ns - trigger_time_ns)
         if self._dt_debug_print_count < 200:
             print(
                 "dt_ns=", dt_ns,
-                "event_min_hit_time_ns=", event_min_hit_time_ns,
+                "event_ref_hit_time_ns=", event_ref_hit_time_ns,
                 "trigger_time_ns=", trigger_time_ns,
             )
             self._dt_debug_print_count += 1
-        #if not (self._store_trigger_dt_min_ns <= dt_ns <= self._store_trigger_dt_max_ns):
-            #return False
+        if not (self._store_trigger_dt_min_ns <= dt_ns <= self._store_trigger_dt_max_ns):
+            return False
 
         fired_layers = set()
         layer_to_cols = {}
@@ -668,9 +670,9 @@ class DecodeThread(QtCore.QThread):
                         # waiting for its first later trigger.
                         if self._pending_events_for_store:
                             pending = self._pending_events_for_store.pop()
-                            event_min_hit_time_ns = pending.get("event_min_hit_time_ns")
+                            event_ref_hit_time_ns = pending.get("event_median_hit_time_ns")
 
-                            if event_min_hit_time_ns is not None:
+                            if event_ref_hit_time_ns is not None:
                                 hits = pending["hits"]
                                 if self._dt_debug_print_count < 260:
                                     print(
@@ -678,18 +680,18 @@ class DecodeThread(QtCore.QThread):
                                         "header_word_index=", pending.get("header_word_index"),
                                         "trigger_word_index=", self._word_index,
                                         "word_gap=", self._word_index - pending.get("header_word_index", self._word_index),
-                                        "event_min_hit_time_ns=", event_min_hit_time_ns,
+                                        "event_ref_hit_time_ns=", event_ref_hit_time_ns,
                                         "trigger_time_ns=", trigger_time_ns,
                                     )
 
                                 keep = self._should_store_event(
                                     hits,
-                                    event_min_hit_time_ns=event_min_hit_time_ns,
+                                    event_ref_hit_time_ns=event_ref_hit_time_ns,
                                     trigger_time_ns=trigger_time_ns,
                                 )
 
                                 if keep:
-                                    dt_ns = self._wrap_delta_ns(event_min_hit_time_ns - trigger_time_ns)
+                                    dt_ns = self._wrap_delta_ns(event_ref_hit_time_ns - trigger_time_ns)
                                     self._kept_match_rows.append(
                                         {
                                             "source": "pending",
@@ -697,7 +699,7 @@ class DecodeThread(QtCore.QThread):
                                             "header_word_index": pending.get("header_word_index"),
                                             "trigger_word_index": self._word_index,
                                             "trigger_time_ns": trigger_time_ns,
-                                            "event_min_hit_time_ns": event_min_hit_time_ns,
+                                            "event_min_hit_time_ns": event_ref_hit_time_ns,
                                             "dt_ns_wrapped": dt_ns,
                                             "n_hits": len(hits),
                                         }
